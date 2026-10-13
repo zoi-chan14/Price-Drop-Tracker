@@ -1,0 +1,224 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import csv
+import smtplib
+from email.message import EmailMessage
+import os
+from dotenv import load_dotenv
+import logging
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(BASE_DIR / "tracker.log", mode="w"), 
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# CHECKING IF CREDENTIALS ARE RIGHT IF NOT THEN EXIT SYSTEM
+def credentials_checking():
+    load_dotenv()
+    address = os.getenv("email_address")
+    password = os.getenv("email_app_password")
+
+    if not address:
+        raise SystemExit("address is missing from .env")
+    if not password: 
+        raise SystemExit("password is missing from .env")
+
+    return address, password
+
+
+def scrape_products():
+
+    urls = [
+        "https://automationexercise.com/brand_products/Kookie%20Kids",
+        "https://automationexercise.com/brand_products/Polo",
+        "https://automationexercise.com/brand_products/H&M",
+        "https://automationexercise.com/brand_products/Madame",
+        "https://automationexercise.com/brand_products/Mast%20&%20Harbour",
+        "https://automationexercise.com/brand_products/Babyhug",
+        "https://automationexercise.com/brand_products/Allen%20Solly%20Junior",
+        "https://automationexercise.com/brand_products/Biba"
+        ]
+
+    data = [] 
+
+    for url in urls:
+
+        try:
+            response = requests.get(url, timeout=10)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed: {e}")
+            continue
+
+        if response.status_code != 200:
+            logger.warning(f"Skipping {url} - status: {response.status_code}")
+            continue
+
+        soup = BeautifulSoup(response.content, "html.parser")
+        products = soup.find_all("div", class_="text-center")
+        if not products:
+            logger.warning(f"Skipping {url} - no products found")
+            continue
+
+        brand_title = soup.find("h2", class_="text-center")
+        if brand_title is None:
+            logger.warning(f"Skipping {url} - couldn't find brand page")
+            continue
+
+        brand = brand_title.get_text().replace("Brand - ","").replace(" Products","")
+
+        for product in products: 
+
+            html_title = product.find("p")
+            if html_title is None:
+                logger.warning(f"Skipping {product} - title not found")
+                continue
+            title = html_title.get_text()
+
+            html_price = product.find("h2")
+            if html_price is None:
+                logger.warning(f"Skipping {product} - price not found")
+                continue
+            price = html_price.get_text()
+
+            digits = ""
+            for d in price:
+                if d.isdigit():
+                    digits += d
+            if not digits:
+                logger.warning(f"Skipping '{title}' - no digits in price: {price!r}")
+                continue
+            converted_digits = int(digits)
+
+            data.append({
+                "Brand": brand,
+                "Title": title,
+                "Price": converted_digits
+            }) 
+    return data
+    
+
+
+def old_data_collecting():
+
+    try:
+        data_collector = {}
+
+        with open(BASE_DIR / "Products.csv", "r", encoding="utf-8-sig") as file:
+            reader = csv.DictReader(file)
+
+            for row in reader:
+                data_collector[(row["Brand"],row["Product"])] = int(row["Price"])
+        return data_collector
+    except FileNotFoundError:
+        logger.warning("No previous data found. This run will create the baseline dataset.")
+        return {}
+
+
+def data_comparison(data_collector, data):
+
+    data_message = []
+    if data_collector and data:
+        for item in data:
+            scraped_brand = item["Brand"]
+            scraped_name = item["Title"]
+            scraped_price = item["Price"]
+
+            old_price = data_collector.get((scraped_brand, scraped_name)) 
+            new_price = scraped_price
+
+            if old_price is not None:
+
+                logger.info(f"Product: {scraped_name}")
+                logger.info(f"Old price: {old_price}")
+                logger.info(f"New price: {new_price}")
+
+                if new_price < old_price:
+                    price_down = f"Price of '{scraped_name}' fell from ${old_price} to ${new_price}"  
+                    data_message.append(price_down) 
+            else:
+                logger.info("Product not found!")
+
+    return data_message
+
+
+def merging_data(data_collector, data):
+
+    for row in data:
+        brands = row["Brand"]
+        title = row["Title"]
+        price = row["Price"]        
+        data_collector[(brands,title)] = price
+
+    return data_collector
+
+def save_products(data_collector):
+ 
+    rows = []
+
+    for (brand,title), price in data_collector.items():
+        rows.append({
+            "Brand": brand,
+            "Product": title,
+            "Price": price
+        })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(BASE_DIR / "Products.csv", index=False, encoding="utf-8-sig") 
+    logger.info("New csv file is created!")
+
+def send_email(address, password, data_message):
+
+    msg = EmailMessage()
+    msg["Subject"] = "New Product file updated"
+    msg["From"] = address
+    msg["To"] = address
+    data_message_separator = "\n".join(data_message)
+    msg.set_content(f"Price drops detected:\n{data_message_separator}") 
+
+    with open(BASE_DIR / "Products.csv", "rb") as f:
+        file_data = f.read()
+
+    msg.add_attachment(
+        file_data,
+        maintype="text",
+        subtype="csv",
+        filename="Products.csv"
+    )
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(address, password)
+        result = server.send_message(msg)
+
+        logger.info(f"Send result: {result}")
+        logger.info("Email sending finished successfully!")
+
+def main():
+    address, password = credentials_checking()
+    logger.info("Scraping started.")
+    data = scrape_products()
+    logger.info(f"Scraped {len(data)} products.")
+    data_collector = old_data_collecting()
+    logger.info(f"{len(data_collector)} old data found.")
+    data_message = data_comparison(data_collector, data)
+    logger.info(f"Found {len(data_message)} price drops.")
+    data_collector = merging_data(data_collector, data)
+    save_products(data_collector)
+    logger.info("File upgraded with fresh data.")
+    if data_message:
+        try:
+            send_email(address, password, data_message)
+        except (smtplib.SMTPException, OSError) as e:
+            logger.error(f"Email failed: {e}")
+    logger.info("Run completed")
+
+if __name__ == "__main__":
+    main()
